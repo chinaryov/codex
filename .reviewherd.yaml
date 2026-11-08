@@ -1,0 +1,141 @@
+# ReviewHerd gate of the chinaryov/codex fork (plan row ACP-14).
+# The fork is upstream openai/codex at the tag recorded in RH-PATCHES.md
+# plus the patches that ledger lists. The checks are inline on purpose:
+# the ledger check allows no fork files besides RH-PATCHES.md and this one.
+#
+# Neither check uses rh/main: in a PR checkout it still names the landed
+# branch, not the candidate. Both compare the recorded upstream base with HEAD.
+# RH_UPSTREAM_URL overrides the upstream remote (for tests of the check).
+
+checks:
+  - name: ledger
+    timeout: 300
+    command: |
+      bash <<'RH_LEDGER_CHECK'
+      set -euo pipefail
+      cd "$(git rev-parse --show-toplevel)"
+      ledger=RH-PATCHES.md
+      upstream_url="${RH_UPSTREAM_URL:-https://github.com/openai/codex.git}"
+      fail() { printf 'ledger: FAIL: %s\n' "$*" >&2; exit 1; }
+      tmp=$(mktemp -d)
+      trap 'rm -rf "$tmp"' EXIT
+
+      # 1. The recorded base: exactly one "Upstream base: <tag> <commit>" line.
+      [ -f "$ledger" ] || fail "$ledger is missing"
+      grep -E '^Upstream base:' "$ledger" > "$tmp/base" || true
+      n=$(wc -l < "$tmp/base")
+      [ "$n" -eq 1 ] || fail "$ledger needs exactly one 'Upstream base: <tag> <40-hex commit>' line, found $n"
+      read -r _ _ tag commit extra < "$tmp/base" || true
+      [[ "$tag" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || fail "bad tag in '$(cat "$tmp/base")'"
+      [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || fail "bad commit in '$(cat "$tmp/base")' (need the full 40-hex id)"
+      [ -z "${extra:-}" ] || fail "extra words after the commit in '$(cat "$tmp/base")'"
+
+      # 2. The recorded commit is the tag's commit upstream (peeled).
+      timeout 120 git ls-remote "$upstream_url" "refs/tags/$tag" "refs/tags/$tag^{}" > "$tmp/remote" \
+        || fail "cannot read tags of $upstream_url"
+      peeled=$(awk -v r="refs/tags/$tag^{}" '$2 == r { print $1 }' "$tmp/remote")
+      [ -n "$peeled" ] || peeled=$(awk -v r="refs/tags/$tag" '$2 == r { print $1 }' "$tmp/remote")
+      [ -n "$peeled" ] || fail "tag $tag does not exist in $upstream_url"
+      [ "$peeled" = "$commit" ] || fail "Upstream base records $commit, but $tag in $upstream_url is $peeled"
+
+      # 3. The recorded commit is an ancestor of HEAD.
+      [ "$(git rev-parse --is-shallow-repository)" = false ] \
+        || fail "shallow clone: cannot prove $commit is an ancestor of HEAD"
+      git cat-file -e "$commit^{commit}" 2>/dev/null \
+        || fail "$commit ($tag) is not an ancestor of HEAD (not in this repository's history)"
+      git merge-base --is-ancestor "$commit" HEAD \
+        || fail "$commit ($tag) is not an ancestor of HEAD $(git rev-parse HEAD)"
+
+      # 4. The diff from the base lists only the fork's files and the patches' files.
+      # Patch files: the "- `path`" lines after a "Files:" line of a "### " section
+      # under "## Patches", outside fenced blocks.
+      awk '
+        /^```/ { fence = !fence; next }
+        fence { next }
+        /^## / { in_patches = ($0 ~ /^## Patches[[:space:]]*$/); files = 0; next }
+        !in_patches { next }
+        /^### / { files = 0; next }
+        /^Files:[[:space:]]*$/ { files = 1; next }
+        files && /^- `[^`]+`[[:space:]]*$/ {
+          p = $0; sub(/^- `/, "", p); sub(/`[[:space:]]*$/, "", p); print p; next
+        }
+        { files = 0 }
+      ' "$ledger" > "$tmp/listed"
+      declare -A allowed=([RH-PATCHES.md]=1 [.reviewherd.yaml]=1)
+      while IFS= read -r f; do allowed["$f"]=1; done < "$tmp/listed"
+
+      git diff --name-only --no-renames -z "$commit" HEAD > "$tmp/changed" \
+        || fail "git diff $commit HEAD failed"
+      # A local run may have uncommitted work; count it too (the gate's checkout is clean).
+      git diff --name-only --no-renames -z HEAD >> "$tmp/changed" || fail "git diff HEAD failed"
+      git ls-files --others --exclude-standard -z >> "$tmp/changed" || fail "git ls-files failed"
+
+      declare -A seen=()
+      bad=0
+      total=0
+      while IFS= read -r -d '' f; do
+        [ -z "${seen[$f]+x}" ] || continue
+        seen["$f"]=1
+        total=$((total + 1))
+        if [ -z "${allowed[$f]+x}" ]; then
+          printf 'ledger: not in %s: %s\n' "$ledger" "$f" >&2
+          bad=$((bad + 1))
+        fi
+      done < "$tmp/changed"
+      while IFS= read -r f; do
+        [ -n "${seen[$f]+x}" ] || printf 'ledger: note: listed but same as upstream: %s\n' "$f"
+      done < "$tmp/listed"
+      [ "$bad" -eq 0 ] || fail "$bad changed file(s) since $tag are not RH-PATCHES.md, .reviewherd.yaml or a patch's file"
+      printf 'ledger: OK: base %s = %s, ancestor of HEAD; %d changed file(s), all in the ledger\n' \
+        "$tag" "$commit" "$total"
+      RH_LEDGER_CHECK
+
+  - name: fmt
+    timeout: 1800
+    command: |
+      bash <<'RH_FMT_CHECK'
+      set -euo pipefail
+      fail() { printf 'fmt: FAIL: %s\n' "$*" >&2; exit 1; }
+      cd "$(git rev-parse --show-toplevel)"
+      commit=$(awk '/^Upstream base:/ { print $4; exit }' RH-PATCHES.md 2>/dev/null || true)
+      [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || fail "no 'Upstream base:' commit in RH-PATCHES.md (see the ledger check)"
+      git cat-file -e "$commit^{commit}" 2>/dev/null || fail "base $commit is not in this repository (see the ledger check)"
+
+      # Touched crates: the nearest Cargo.toml with a [package] above each changed path.
+      root=$PWD
+      tmp=$(mktemp -d)
+      trap 'rm -rf "$tmp"' EXIT
+      git diff --name-only --no-renames -z "$commit" HEAD > "$tmp/changed" || fail "git diff $commit HEAD failed"
+      git diff --name-only --no-renames -z HEAD >> "$tmp/changed" || fail "git diff HEAD failed"
+      git ls-files --others --exclude-standard -z >> "$tmp/changed" || fail "git ls-files failed"
+      declare -A crates=()
+      while IFS= read -r -d '' f; do
+        d=$(dirname "$f")
+        while :; do
+          if [ -f "$root/$d/Cargo.toml" ] && grep -q '^\[package\]' "$root/$d/Cargo.toml"; then
+            crates["$d"]=1
+            break
+          fi
+          [ "$d" = . ] && break
+          d=$(dirname "$d")
+        done
+      done < "$tmp/changed"
+      if [ "${#crates[@]}" -eq 0 ]; then
+        echo "fmt: OK: no Rust crate touched since $commit"
+        exit 0
+      fi
+      if ! command -v cargo >/dev/null 2>&1; then
+        echo "fmt: SKIPPED: cargo is not installed on this host (Rust toolchain, ACP-22);" \
+          "not checked: ${!crates[*]}"
+        exit 0
+      fi
+      status=0
+      for d in "${!crates[@]}"; do
+        echo "fmt: cargo fmt --check in $d"
+        # Same options as upstream's scripts/format.py; run in the crate so
+        # codex-rs/rust-toolchain.toml and rustfmt.toml apply.
+        (cd "$root/$d" && cargo fmt --check -- --config imports_granularity=Item) || status=1
+      done
+      [ "$status" -eq 0 ] || fail "formatting differs in touched crates (run: just fmt)"
+      echo "fmt: OK: ${!crates[*]}"
+      RH_FMT_CHECK
