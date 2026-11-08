@@ -36,6 +36,13 @@ Only a `### P-<n>: <title>` section with `Why:` and `Upstream:` lines
 authorizes its files. The check fails on a `Files:` line outside such a
 section and on a `### ` section under `## Patches` of another shape.
 
+Fenced blocks follow CommonMark: a block opened by a run of backticks or
+tildes ends only at a run of the same character, at least as long, with
+nothing after it but blanks. Nothing inside a fence counts. To keep the
+parse unambiguous, the check also fails on a heading or fence indented by
+spaces, on HTML, on a `===` or `---` line right under a line of text, and,
+under `## Patches`, on a block quote or a list other than a `Files:` list.
+
 ## Patches
 
 None yet.
