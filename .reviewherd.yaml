@@ -10,7 +10,7 @@
 checks:
   - name: ledger
     timeout: 300
-    command: |
+    cmd: |
       bash <<'RH_LEDGER_CHECK'
       set -euo pipefail
       cd "$(git rev-parse --show-toplevel)"
@@ -47,20 +47,57 @@ checks:
         || fail "$commit ($tag) is not an ancestor of HEAD $(git rev-parse HEAD)"
 
       # 4. The diff from the base lists only the fork's files and the patches' files.
-      # Patch files: the "- `path`" lines after a "Files:" line of a "### " section
-      # under "## Patches", outside fenced blocks.
+      # Patch files: the "- `path`" lines after a "Files:" line of a "### P-<n>: <title>"
+      # section under "## Patches", outside fenced blocks. Only a patch section with
+      # "Why:" and "Upstream:" lines authorizes files. A "Files:" line outside such a
+      # section, or a "### " section under "## Patches" of another shape, fails the check.
       awk '
-        /^```/ { fence = !fence; next }
-        fence { next }
-        /^## / { in_patches = ($0 ~ /^## Patches[[:space:]]*$/); files = 0; next }
+        function bad(msg) {
+          printf "ledger: %s:%d: %s\n", FILENAME, FNR, msg > "/dev/stderr"; errors++
+        }
+        # Close the current patch section; its files count only if it is documented.
+        function close_patch() {
+          if (patch && nfiles > 0 && !(why && up))
+            bad("patch \"" title "\" lists files but lacks a \"Why:\" or \"Upstream:\" line")
+          else if (patch)
+            for (i = 1; i <= nfiles; i++) print pending[i]
+          patch = 0; files = 0; nfiles = 0; why = 0; up = 0; title = ""
+        }
+        {
+          # CommonMark: fences and headings may be indented by up to three spaces.
+          line = $0; match(line, /^ */); indent = RLENGTH; sub(/^ */, "", line)
+        }
+        fence != "" {
+          if (indent < 4 && substr(line, 1, 3) == fence) fence = ""
+          next
+        }
+        indent < 4 && (substr(line, 1, 3) == "```" || substr(line, 1, 3) == "~~~") {
+          fence = substr(line, 1, 3); files = 0; next
+        }
+        indent < 4 && line ~ /^##?([[:space:]]|$)/ {
+          close_patch(); in_patches = (line ~ /^## Patches[[:space:]]*$/); next
+        }
         !in_patches { next }
-        /^### / { files = 0; next }
-        /^Files:[[:space:]]*$/ { files = 1; next }
+        indent < 4 && line ~ /^###([[:space:]]|$)/ {
+          close_patch()
+          if (line ~ /^### P-[0-9]+: [^[:space:]]/) { patch = 1; title = line; sub(/^### /, "", title) }
+          else bad("a section under \"## Patches\" must be headed \"### P-<n>: <title>\": " line)
+          next
+        }
+        indent < 4 && line ~ /^####/ { files = 0; next }
+        /^Files:[[:space:]]*$/ {
+          if (patch) files = 1
+          else bad("\"Files:\" outside a \"### P-<n>: <title>\" patch section")
+          next
+        }
         files && /^- `[^`]+`[[:space:]]*$/ {
-          p = $0; sub(/^- `/, "", p); sub(/`[[:space:]]*$/, "", p); print p; next
+          p = $0; sub(/^- `/, "", p); sub(/`[[:space:]]*$/, "", p); pending[++nfiles] = p; next
         }
         { files = 0 }
-      ' "$ledger" > "$tmp/listed"
+        patch && /^Why:[[:space:]]*[^[:space:]]/ { why = 1 }
+        patch && /^Upstream:[[:space:]]*[^[:space:]]/ { up = 1 }
+        END { close_patch(); exit errors > 0 }
+      ' "$ledger" > "$tmp/listed" || fail "$ledger: malformed \"## Patches\" (see above)"
       declare -A allowed=([RH-PATCHES.md]=1 [.reviewherd.yaml]=1)
       while IFS= read -r f; do allowed["$f"]=1; done < "$tmp/listed"
 
@@ -92,7 +129,7 @@ checks:
 
   - name: fmt
     timeout: 1800
-    command: |
+    cmd: |
       bash <<'RH_FMT_CHECK'
       set -euo pipefail
       fail() { printf 'fmt: FAIL: %s\n' "$*" >&2; exit 1; }
@@ -108,11 +145,16 @@ checks:
       git diff --name-only --no-renames -z "$commit" HEAD > "$tmp/changed" || fail "git diff $commit HEAD failed"
       git diff --name-only --no-renames -z HEAD >> "$tmp/changed" || fail "git diff HEAD failed"
       git ls-files --others --exclude-standard -z >> "$tmp/changed" || fail "git ls-files failed"
+      # Count crates separately: under set -u, some bash versions treat an empty
+      # associative array as unset, so "${#crates[@]}" would abort on zero crates.
+      # Every "${!crates[...]}" below runs only when ncrates > 0.
       declare -A crates=()
+      ncrates=0
       while IFS= read -r -d '' f; do
         d=$(dirname "$f")
         while :; do
           if [ -f "$root/$d/Cargo.toml" ] && grep -q '^\[package\]' "$root/$d/Cargo.toml"; then
+            [ -n "${crates[$d]+x}" ] || ncrates=$((ncrates + 1))
             crates["$d"]=1
             break
           fi
@@ -120,7 +162,7 @@ checks:
           d=$(dirname "$d")
         done
       done < "$tmp/changed"
-      if [ "${#crates[@]}" -eq 0 ]; then
+      if [ "$ncrates" -eq 0 ]; then
         echo "fmt: OK: no Rust crate touched since $commit"
         exit 0
       fi

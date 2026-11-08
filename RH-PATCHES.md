@@ -32,6 +32,9 @@ Files:
 
 The `Files:` list is a run of `` - `path` `` lines, one path per line,
 relative to the repository root. The list ends at the first other line.
+Only a `### P-<n>: <title>` section with `Why:` and `Upstream:` lines
+authorizes its files. The check fails on a `Files:` line outside such a
+section and on a `### ` section under `## Patches` of another shape.
 
 ## Patches
 
